@@ -1,373 +1,388 @@
-#!/usr/bin/env python3
+# ===== Whale Footprint Telegram Bot Files (Auto-Hybrid) =====
+# This document contains three files you can copy to your project:
+# 1) bot.py  (main program)
+# 2) requirements.txt
+# 3) Procfile
+
+# ===== FILE: bot.py =====
 """
-Liquidity Matrix Bot v2
-- Upgraded: Post-Sweep Delay Entry Filter, safe SL, volume filter, second-touch / candle-confirmation, multi-TF confirm.
-- Replace TELEGRAM_TOKEN, TELEGRAM_CHAT_ID and TD_API_KEY in CONFIG or use environment variables.
-- Uses TwelveData by default. You can plug another provider by changing twelvedata_get_series().
+Whale Footprint Auto-Hybrid Telegram Bot (Python 3.10)
+- Uses Bitget public endpoints to fetch SPOT + FUTURES data (passphrase optional)
+- Detects footprint (stop-hunt) candles, checks Volume Delta approximation, OI spike,
+  CVD confirmation and CoinGlass public liquidation heatmap as an extra filter
+- Sends alerts to Telegram (no live order placement)
+
+Deploy: Render.com (Procfile provided). Set environment variables in Render secrets.
 """
 
+from __future__ import annotations
 import os
 import time
 import math
 import requests
-from datetime import datetime, timedelta, time as dtime
-from apscheduler.schedulers.background import BackgroundScheduler
-from typing import List, Dict, Any, Optional
+import json
+from collections import defaultdict
+from typing import List, Dict, Tuple, Optional
+from telegram import Bot
+from dotenv import load_dotenv
 
-# ------------------ CONFIG (EDIT BEFORE RUN) ------------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")     # put your token or set env var
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "") # chat id or channel
-TD_API_KEY = os.getenv("TD_API_KEY", "")             # TwelveData API key
+# Load env (for local testing)
+load_dotenv()
 
-SYMBOL_XAU = "XAU/USD"
-SYMBOL_BTC = "BTC/USD"
+# ---------------------- CONFIG / ENV ----------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+BITGET_API_KEY = os.getenv("BITGET_API_KEY", "")
+BITGET_API_SECRET = os.getenv("BITGET_API_SECRET", "")
+# passphrase optional - if not provided we still use public futures endpoints
+BITGET_PASSPHRASE = os.getenv("BITGET_PASSPHRASE", "")
 
-# PK timezone session start (PK = UTC+5)
-NY_SESSION_START_PK = dtime(hour=17, minute=0)
-PRE_ALERT_MINUTES = 5
-POST_ALERT_MINUTES = 5
+# Symbols: allow separate spot/futures symbols if needed
+SPOT_SYMBOL = os.getenv("SPOT_SYMBOL", "BTCUSDT")
+FUTURES_SYMBOL = os.getenv("FUTURES_SYMBOL", "BTCUSDT")
+INTERVAL = os.getenv("INTERVAL", "15m")
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 
-# Strategy tuning
-XAU_SL_PIPS = 20            # pip notion for calculating base SL (0.01 pip unit)
-XAU_PIP = 0.01
-BTC_SL_USD = 350
-RR = 4                      # desired risk:reward
-SL_BUFFER_PIPS = 5          # extra buffer to avoid stop-hunts (in pips for XAU)
-RETEST_TOUCH_ALLOWANCE = 2  # require second touch (ignore first touch)
-CONFIRM_VOLUME_MULT = 1.0   # confirm volume must be > avg_prev_2 * this multiplier (if volume available)
-LOOKBACK_15M = 96           # ~24 hours of 15m candles (96 * 15m)
-LOOKBACK_5M = 288           # ~24 hours of 5m candles (288 * 5m)
-MIN_CANDLES_REQUIRED = 20
+# Strategy params (adjustable via env too)
+RR = int(os.getenv("RR", "4"))
+VOL_SMA_LEN = int(os.getenv("VOL_SMA_LEN", "20"))
+VOL_MULT = float(os.getenv("VOL_MULT", "2.2"))
+WICK_RATIO = float(os.getenv("WICK_RATIO", "0.35"))
+USE_NY_SESSION = os.getenv("USE_NY_SESSION", "true").lower() in ("1","true","yes")
+NY_START_UTC = int(os.getenv("NY_START_UTC", "12"))
+NY_END_UTC = int(os.getenv("NY_END_UTC", "17"))
+LIQ_THRESHOLD = float(os.getenv("LIQ_THRESHOLD", "10000"))
+MIN_RANGE = float(os.getenv("MIN_RANGE", "0"))  # optional
 
-# ------------------ HELPERS ------------------
+BITGET_PUBLIC_REST = "https://api.bitget.com"
+COINGLASS_PUBLIC = "https://open-api.coinglass.com"
+COINGLASS_PUBLIC_V2 = "https://open-api.coinglass.com/public/v2"
 
-def send_telegram_message(text: str):
-    """Send message via Telegram bot; returns response dict or None."""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials not set; message not sent.")
-        print("Message preview:\n", text)
-        return None
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    try:
-        r = requests.post(url, json=payload, timeout=10)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print("Telegram send error:", e)
-        return None
+bot = Bot(token=TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
-def twelvedata_get_series(symbol: str, interval: str = "15min", outputsize: int = 200) -> List[Dict[str, Any]]:
-    """Fetch time series from TwelveData (newest-first) and return oldest-first list."""
-    if not TD_API_KEY:
-        raise RuntimeError("TwelveData API key not set.")
-    base = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "format": "JSON",
-        "apikey": TD_API_KEY
-    }
-    r = requests.get(base, params=params, timeout=12)
-    r.raise_for_status()
-    data = r.json()
-    if "values" not in data:
-        raise RuntimeError(f"TwelveData error or invalid response: {data}")
-    return list(reversed(data["values"]))
+# ---------------------- UTILITIES ----------------------
 
-def parse_candles(raw_candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Convert raw to candles with numeric fields and datetime objects."""
-    out = []
-    for c in raw_candles:
-        # volume may be missing or 'null'
-        vol = c.get("volume")
-        vol_f = float(vol) if vol not in (None, "", "null") else 0.0
-        out.append({
-            "datetime": datetime.fromisoformat(c["datetime"]),
-            "open": float(c["open"]),
-            "high": float(c["high"]),
-            "low": float(c["low"]),
-            "close": float(c["close"]),
-            "volume": vol_f
-        })
+def _interval_to_seconds(interval: str) -> int:
+    if interval.endswith("m"):
+        return int(interval[:-1]) * 60
+    if interval.endswith("h"):
+        return int(interval[:-1]) * 3600
+    if interval.endswith("d"):
+        return int(interval[:-1]) * 86400
+    return 900
+
+
+def sma(values: List[float], length: int) -> List[float]:
+    out: List[float] = []
+    s = 0.0
+    for i, v in enumerate(values):
+        s += v
+        if i >= length:
+            s -= values[i - length]
+            out.append(s / length)
+        else:
+            out.append(s / (i + 1))
     return out
 
-# ------------------ DETECTION LOGIC ------------------
 
-def detect_sweep_and_green(candles_15m: List[Dict[str, Any]], lookback: int = 6) -> Dict[str, Any]:
-    """
-    Detect sweep on 15m with green confirm.
-    Returns dict: {'signal': bool, 'sweep_candle': c, 'confirm_candle': c2, 'sweep_index': idx}
-    """
-    if len(candles_15m) < lookback + 2:
-        return {"signal": False, "reason": "not_enough_data"}
-    window = candles_15m[-(lookback+1):]
-    for i in range(1, len(window)-1):
-        if window[i]["low"] < window[i-1]["low"] and window[i]["low"] < window[i+1]["low"]:
-            body = abs(window[i]["open"] - window[i]["close"])
-            lower_wick = (window[i]["open"] - window[i]["low"]) if window[i]["open"] > window[i]["close"] else (window[i]["close"] - window[i]["low"])
-            rng = (window[i]["high"] - window[i]["low"]) if (window[i]["high"] - window[i]["low"])>0 else 1e-6
-            if lower_wick / rng > 0.35:
-                # require subsequent candle(s) contain a green close (confirm)
-                next_c = window[i+1]
-                if next_c["close"] > next_c["open"]:
-                    return {
-                        "signal": True,
-                        "sweep_candle": window[i],
-                        "confirm_candle": next_c,
-                        "sweep_idx_in_15m": len(candles_15m) - (lookback+1) + i
-                    }
-    return {"signal": False, "reason": "no_sweep"}
+def compute_cvd(candles: List[Dict]) -> List[float]:
+    cvd: List[float] = []
+    s = 0.0
+    for c in candles:
+        delta = 0.0
+        if c["close"] > c["open"]:
+            delta = c["volume"]
+        elif c["close"] < c["open"]:
+            delta = -c["volume"]
+        s += delta
+        cvd.append(s)
+    return cvd
 
-def detect_second_touch_and_confirmation(candles_15m: List[Dict[str, Any]],
-                                         candles_5m: List[Dict[str, Any]],
-                                         sweep_low: float,
-                                         breakout_body_high: float) -> Dict[str, Any]:
-    """
-    After breakout and sweep, check for retest touches and require either:
-      - second physical touch of zone (count touches)
-      - OR a confirming candle on 5m/15m: bullish engulfing OR strong wick rejection with >=50% recovery
-    Also enforces volume check if available.
-    Returns dict: {'ok': bool, 'entry': price, 'reason': text, 'confirm_candle': {...}}
-    """
-    # Define retest zone: small band around breakout_body_high down to sweep_low
-    zone_top = breakout_body_high
-    zone_bottom = sweep_low
-    # Count touches in 5m candles (last 200)
-    touches = 0
-    for c in candles_5m[-60:]:  # last 5 hours approx on 5m
-        if c["low"] <= zone_top and c["low"] >= zone_bottom - 0.5:  # allow small slop
-            touches += 1
-    # If touches >= RETEST_TOUCH_ALLOWANCE -> consider as multi-touch
-    if touches >= RETEST_TOUCH_ALLOWANCE:
-        # Look for a confirming bullish candle right after the last touch (5m)
-        # find last candle touching zone
-        last_touch_idx = None
-        for i in range(len(candles_5m)-1, -1, -1):
-            c = candles_5m[i]
-            if c["low"] <= zone_top and c["low"] >= zone_bottom - 0.5:
-                last_touch_idx = i
-                break
-        if last_touch_idx is None:
-            return {"ok": False, "reason": "touch_count_but_no_index"}
-        # candidate confirm candle is next 1-2 candles
-        for j in range(1, 3):
-            idx = last_touch_idx + j
-            if idx >= len(candles_5m):
-                break
-            cand = candles_5m[idx]
-            # bullish engulfing on 5m vs previous
-            if idx-1 >= 0:
-                prev = candles_5m[idx-1]
-                if (prev["close"] < prev["open"] and cand["close"] > cand["open"]
-                    and cand["close"] > prev["open"] and cand["open"] < prev["close"]):
-                    # volume check
-                    avg_prev2_vol = (prev["volume"] + candles_5m[idx-2]["volume"]) / 2 if idx-2 >= 0 else prev["volume"]
-                    if avg_prev2_vol == 0 or cand["volume"] >= avg_prev2_vol * CONFIRM_VOLUME_MULT:
-                        entry = max(cand["open"] + 0.02, (cand["close"] + zone_bottom) / 2)
-                        return {"ok": True, "entry": round(entry, 3), "confirm_candle": cand, "reason": "engulfing_after_second_touch"}
-            # strong wick rejection check: wick recovery >= 50%
-            wick_low = cand["low"]
-            wick_recovery = cand["close"] - wick_low
-            body = abs(cand["open"] - cand["close"])
-            if wick_low <= zone_top and wick_recovery >= (cand["high"] - wick_low) * 0.5 and cand["close"] > cand["open"]:
-                avg_prev2_vol = 0
-                if idx-1 >= 0 and idx-2 >= 0:
-                    avg_prev2_vol = (candles_5m[idx-1]["volume"] + candles_5m[idx-2]["volume"]) / 2
-                if avg_prev2_vol == 0 or cand["volume"] >= avg_prev2_vol * CONFIRM_VOLUME_MULT:
-                    entry = max(cand["open"] + 0.02, (cand["close"] + zone_bottom) / 2)
-                    return {"ok": True, "entry": round(entry, 3), "confirm_candle": cand, "reason": "wick_rejection_after_second_touch"}
-        return {"ok": False, "reason": "no_confirm_after_second_touch", "touches": touches}
-    else:
-        # If touches < required, allow *only* if there's a clear confirming candle that is not the immediate first touch
-        # Search last 6 5m candles for a confirming candle not immediately at first touch
-        last_6 = candles_5m[-6:]
-        for idx, cand in enumerate(last_6):
-            # bullish engulfing vs previous within last_6 set
-            if idx > 0:
-                prev = last_6[idx-1]
-                if (prev["close"] < prev["open"] and cand["close"] > cand["open"]
-                    and cand["close"] > prev["open"] and cand["open"] < prev["close"]):
-                    avg_prev2_vol = (prev["volume"] + (last_6[idx-2]["volume"] if idx-2>=0 else prev["volume"])) / 2
-                    if avg_prev2_vol == 0 or cand["volume"] >= avg_prev2_vol * CONFIRM_VOLUME_MULT:
-                        # ensure cand not immediate first touch: if the first touch was exactly one candle earlier, ignore
-                        return {"ok": True, "entry": round(max(cand["open"] + 0.02, (cand["close"] + zone_bottom) / 2), 3),
-                                "confirm_candle": cand, "reason": "engulfing_no_second_touch_but_strong_confirm"}
-        return {"ok": False, "reason": "not_enough_touches_and_no_confirm"}
+# ---------------------- BITGET ENDPOINTS (public) ----------------------
 
-def compute_liquidity_zones(candles: List[Dict[str, Any]]) -> Dict[str, float]:
-    lows = [c["low"] for c in candles]
-    highs = [c["high"] for c in candles]
-    return {
-        "recent_low": min(lows),
-        "recent_high": max(highs),
-        "last_close": candles[-1]["close"]
-    }
-
-# ------------------ TRADE PLAN BUILDER ------------------
-
-def build_xau_trade_plan(detection: Dict[str, Any], candles_15m: List[Dict[str, Any]], candles_5m: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """
-    Uses detection result, then applies second-touch + confirmation logic to build trade.
-    Returns plan dict or None.
-    """
-    if not detection.get("signal"):
-        return None
-    sweep = detection["sweep_candle"]
-    confirm = detection["confirm_candle"]
-    sweep_low = sweep["low"]
-    breakout_body_high = confirm["high"]  # approximate breakout body high used as zone top
-    # check second-touch / confirmation on 5m
-    sec = detect_second_touch_and_confirmation(candles_15m, candles_5m, sweep_low, breakout_body_high)
-    if not sec.get("ok"):
-        return None
-    entry = sec["entry"]
-    # SL: below sweep_low with buffer
-    sl_price = sweep_low - (SL_BUFFER_PIPS * XAU_PIP) - (XAU_SL_PIPS * XAU_PIP * 0.0)  # primary safety below sweep
-    rr_distance = entry - sl_price
-    tp = entry + rr_distance * RR
-    tp1 = entry + rr_distance * 1.0
-    return {
-        "side": "LONG",
-        "entry": round(entry, 3),
-        "sl": round(sl_price, 3),
-        "tp": round(tp, 3),
-        "tp1": round(tp1, 3),
-        "confidence": 0.85,
-        "logic": f"Sweep+Green 15m + second-touch confirm ({sec.get('reason')})",
-        "confirm_candle": sec.get("confirm_candle")
-    }
-
-def build_btc_trade_plan(detection: Dict[str, Any], candles_15m: List[Dict[str, Any]], candles_5m: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not detection.get("signal"):
-        return None
-    sweep = detection["sweep_candle"]
-    confirm = detection["confirm_candle"]
-    sweep_low = sweep["low"]
-    breakout_body_high = confirm["high"]
-    sec = detect_second_touch_and_confirmation(candles_15m, candles_5m, sweep_low, breakout_body_high)
-    if not sec.get("ok"):
-        return None
-    entry = sec["entry"]
-    sl_price = sweep_low - BTC_SL_USD  # larger nominal SL for BTC
-    rr_distance = entry - sl_price
-    tp = entry + rr_distance * RR
-    return {
-        "side": "LONG",
-        "entry": round(entry, 2),
-        "sl": round(sl_price, 2),
-        "tp": round(tp, 2),
-        "tp1": round(entry + rr_distance * 1.0, 2),
-        "confidence": 0.80,
-        "logic": f"Sweep+Green 15m + second-touch confirm ({sec.get('reason')})",
-        "confirm_candle": sec.get("confirm_candle")
-    }
-
-# ------------------ ANALYSIS & FORMATTING ------------------
-
-def get_and_analyze(symbol: str, interval_15m: str = "15min", interval_5m: str = "5min") -> Dict[str, Any]:
+def fetch_futures_klines(symbol: str, interval: str, limit: int = 200) -> List[Dict]:
+    """Fetch futures (mix) klines from Bitget public mix endpoint. Returns ascending list."""
+    url = f"{BITGET_PUBLIC_REST}/api/mix/v1/market/candles"
+    params = {"symbol": symbol, "granularity": _interval_to_seconds(interval), "limit": limit}
     try:
-        raw_15m = twelvedata_get_series(symbol, interval=interval_15m, outputsize=LOOKBACK_15M)
-        raw_5m = twelvedata_get_series(symbol, interval=interval_5m, outputsize=LOOKBACK_5M)
-    except Exception as e:
-        return {"error": f"data_fetch_error: {e}"}
-    candles_15m = parse_candles(raw_15m)
-    candles_5m = parse_candles(raw_5m)
-    if len(candles_15m) < MIN_CANDLES_REQUIRED or len(candles_5m) < MIN_CANDLES_REQUIRED:
-        return {"error": "not_enough_candles"}
-    detection = detect_sweep_and_green(candles_15m, lookback=6)
-    liquidity = compute_liquidity_zones(candles_15m[-LOOKBACK_15M:])
-    result = {
-        "symbol": symbol,
-        "detection": detection,
-        "liquidity": liquidity,
-        "latest_15m": candles_15m[-1],
-        "latest_5m": candles_5m[-1],
-        "candles_15m": candles_15m,
-        "candles_5m": candles_5m
-    }
-    # build plan if signal
-    if detection.get("signal"):
-        if "XAU" in symbol:
-            result["plan"] = build_xau_trade_plan(detection, candles_15m, candles_5m)
+        r = requests.get(url, params=params, timeout=12)
+        if r.status_code == 200:
+            data = r.json().get("data") or []
+            parsed: List[Dict] = []
+            for it in data:
+                if isinstance(it, list) and len(it) >= 6:
+                    parsed.append({
+                        "time": int(float(it[0])),
+                        "open": float(it[1]),
+                        "high": float(it[2]),
+                        "low": float(it[3]),
+                        "close": float(it[4]),
+                        "volume": float(it[5]),
+                    })
+            return list(reversed(parsed))
         else:
-            result["plan"] = build_btc_trade_plan(detection, candles_15m, candles_5m)
-    return result
-
-def format_plan_message(analysis: Dict[str, Any]) -> str:
-    if "error" in analysis:
-        return f"⚠ Error: {analysis['error']}"
-    if not analysis.get("plan"):
-        # give helpful liquidity snapshot
-        return (f"ℹ <b>{analysis['symbol']}</b>\n"
-                f"No qualified setup (after second-touch + confirm rules).\n"
-                f"Liquidity (24h): Low {analysis['liquidity']['recent_low']}, High {analysis['liquidity']['recent_high']}\n"
-                f"Latest 15m close: {analysis['latest_15m']['close']}")
-    p = analysis["plan"]
-    msg = f"<b>Pro SmartMoney Setup — {analysis['symbol']}</b>\n"
-    msg += f"Logic: {p['logic']}\n"
-    msg += f"Side: <b>{p['side']}</b>\n"
-    msg += f"Entry: <code>{p['entry']}</code>\nSL: <code>{p['sl']}</code>\nTP: <code>{p['tp']}</code>\nTP1: <code>{p.get('tp1')}</code>\nConfidence: {int(p['confidence']*100)}%\n\n"
-    msg += f"Liquidity (24h): Low {analysis['liquidity']['recent_low']}, High {analysis['liquidity']['recent_high']}\n"
-    msg += f"Confirm candle time: {p.get('confirm_candle', {}).get('datetime')}\n"
-    msg += "Trade Management:\n- TP1 hit -> move SL to break-even\n- TP2 hit -> scale out 50%\n- TP3 -> leave runner or full close\n"
-    msg += "\n---\nPowered by Liquidity Matrix Bot v2"
-    return msg
-
-# ------------------ SCHEDULED JOBS ------------------
-
-def job_pre_alert():
-    now = datetime.utcnow() + timedelta(hours=5)
-    text = f"🕒 <b>Pre-NY Alert</b>\nTime (PK): {now.strftime('%Y-%m-%d %H:%M')}\nScanning XAU & BTC for qualified setups..."
-    send_telegram_message(text)
-    try:
-        x = get_and_analyze(SYMBOL_XAU)
-        b = get_and_analyze(SYMBOL_BTC)
-        send_telegram_message(format_plan_message(x))
-        send_telegram_message(format_plan_message(b))
+            print("futures klines status", r.status_code, r.text[:200])
     except Exception as e:
-        send_telegram_message(f"Pre-alert error: {e}")
+        print("fetch_futures_klines err", e)
+    return []
 
-def job_post_open():
-    now = datetime.utcnow() + timedelta(hours=5)
-    text = f"🕒 <b>NY Post-Open Alert</b>\nTime (PK): {now.strftime('%Y-%m-%d %H:%M')}\nScanning for qualified setups (second-touch + confirm)..."
-    send_telegram_message(text)
+
+def fetch_spot_klines(symbol: str, interval: str, limit: int = 200) -> List[Dict]:
+    """Fetch spot klines. Tries common Bitget spot endpoint format."""
+    # Bitget spot endpoint sometimes uses instrument id format, try a couple methods
+    url1 = f"{BITGET_PUBLIC_REST}/api/spot/v3/instruments/{symbol}/candles"
+    params = {"granularity": _interval_to_seconds(interval), "limit": limit}
     try:
-        x = get_and_analyze(SYMBOL_XAU)
-        b = get_and_analyze(SYMBOL_BTC)
-        send_telegram_message(format_plan_message(x))
-        send_telegram_message(format_plan_message(b))
+        r = requests.get(url1, params=params, timeout=10)
+        if r.status_code == 200:
+            data = r.json() or []
+            parsed = []
+            for it in data:
+                if isinstance(it, list) and len(it) >= 6:
+                    parsed.append({
+                        "time": int(float(it[0])),
+                        "open": float(it[1]),
+                        "high": float(it[2]),
+                        "low": float(it[3]),
+                        "close": float(it[4]),
+                        "volume": float(it[5]),
+                    })
+            return list(reversed(parsed))
+        else:
+            # fallback: try mix endpoint (sometimes works for symbols)
+            return fetch_futures_klines(symbol, interval, limit)
     except Exception as e:
-        send_telegram_message(f"Post-open error: {e}")
+        print("fetch_spot_klines err", e)
+    return []
 
-def start_scheduler():
-    sched = BackgroundScheduler(timezone="UTC")
-    # Convert PK (UTC+5) times to UTC hours
-    pre_utc_hour = (NY_SESSION_START_PK.hour - PRE_ALERT_MINUTES//60) - 5
-    # simpler: schedule PK 16:55 and 17:05 converted to UTC
-    sched.add_job(job_pre_alert, 'cron', hour=11, minute=55)  # PK16:55 -> UTC11:55
-    sched.add_job(job_post_open, 'cron', hour=12, minute=5)  # PK17:05 -> UTC12:05
-    sched.start()
-    print("Scheduler started. Pre-alert at PK 16:55, Post-open at PK 17:05")
+
+def fetch_futures_open_interest(symbol: str) -> float:
     try:
-        while True:
-            time.sleep(1)
-    except (KeyboardInterrupt, SystemExit):
-        sched.shutdown()
+        url = f"{BITGET_PUBLIC_REST}/api/mix/v1/market/openInterest?symbol={symbol}"
+        r = requests.get(url, timeout=8)
+        if r.status_code == 200:
+            j = r.json()
+            data = j.get("data") or {}
+            for k in ("openInterest", "open_interest", "oi"):
+                if k in data:
+                    return float(data[k])
+    except Exception as e:
+        print("fetch_futures_open_interest err", e)
+    return 0.0
 
-# ------------------ MAIN ------------------
+# ---------------------- FOOTPRINT DETECTION ----------------------
+
+def detect_stop_hunt_and_footprint(candles: List[Dict]) -> Tuple[List[int], List[int], List[float]]:
+    volumes = [c["volume"] for c in candles]
+    vol_sma = sma(volumes, VOL_SMA_LEN)
+    cvd = compute_cvd(candles)
+
+    buy_idxs: List[int] = []
+    sell_idxs: List[int] = []
+    for i, c in enumerate(candles):
+        high, low, op, cl = c["high"], c["low"], c["open"], c["close"]
+        rng = high - low
+        if rng <= 0:
+            continue
+        lower_wick = min(op, cl) - low
+        upper_wick = high - max(op, cl)
+        lower_ratio = lower_wick / rng
+        upper_ratio = upper_wick / rng
+        vol_ok = True
+        if i < len(vol_sma):
+            vol_ok = c["volume"] > vol_sma[i] * VOL_MULT
+        delta = c["volume"] if cl > op else (-c["volume"] if cl < op else 0)
+
+        if vol_ok and lower_ratio >= WICK_RATIO and delta > 0 and (rng >= MIN_RANGE or MIN_RANGE == 0):
+            buy_idxs.append(i)
+        if vol_ok and upper_ratio >= WICK_RATIO and delta < 0 and (rng >= MIN_RANGE or MIN_RANGE == 0):
+            sell_idxs.append(i)
+    return buy_idxs, sell_idxs, cvd
+
+
+def is_in_ny_session(ts: int) -> bool:
+    utc_hour = (ts // 1000) // 3600 % 24
+    return NY_START_UTC <= utc_hour < NY_END_UTC
+
+
+def check_oi_spike(oi_hist: List[float], threshold_percent: float = 1.5) -> bool:
+    if len(oi_hist) < 12:
+        return False
+    sma10 = sum(oi_hist[-12:-2]) / 10.0
+    last = oi_hist[-1]
+    if sma10 <= 0:
+        return False
+    return (last - sma10) / sma10 * 100.0 >= threshold_percent
+
+# ---------------------- COINGLASS (public) ----------------------
+
+def fetch_coinglass_liquidation_info(time_type: str = "h1", symbol: str = "BTC") -> Optional[dict]:
+    url = f"{COINGLASS_PUBLIC_V2}/liquidation_info"
+    params = {"time_type": time_type, "symbol": symbol}
+    try:
+        r = requests.get(url, params=params, timeout=8)
+        if r.status_code == 200:
+            return r.json()
+        print("coinglass liq status", r.status_code)
+    except Exception as e:
+        print("fetch_coinglass_liquidation_info err", e)
+    return None
+
+
+def parse_coinglass_into_heatmap(liq_json: Optional[dict]) -> Dict[float, float]:
+    buckets: Dict[float, float] = defaultdict(float)
+    if not liq_json:
+        return buckets
+    try:
+        data = liq_json.get("data") if isinstance(liq_json, dict) else None
+        if not data:
+            return buckets
+        items = data.get("items") or data.get("list") or []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            price = float(it.get("price", 0) or 0)
+            amount = float(it.get("liquidation", 0) or 0)
+            if price and amount:
+                buckets[price] += amount
+    except Exception as e:
+        print("parse_coinglass_into_heatmap err", e)
+    return dict(buckets)
+
+
+def get_liquidation_heatmap(symbol: str = "BTC") -> Dict[float, float]:
+    sym = symbol.replace("USDT", "")[:6]
+    j = fetch_coinglass_liquidation_info(time_type="h1", symbol=sym)
+    return parse_coinglass_into_heatmap(j)
+
+
+def liquidation_mass_near(price: float, heatmap: Dict[float, float], window: float = 50.0) -> float:
+    total = 0.0
+    for p, amt in heatmap.items():
+        if abs(p - price) <= window:
+            total += amt
+    return total
+
+# ---------------------- TELEGRAM ALERT ----------------------
+
+def send_alert(text: str) -> None:
+    try:
+        if bot and TELEGRAM_CHAT_ID:
+            bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+            print("Alert sent:", text)
+        else:
+            print("Alert (no telegram configured):", text)
+    except Exception as e:
+        print("send_alert err", e)
+
+# ---------------------- MAIN LOOP ----------------------
+
+def main_loop() -> None:
+    print("Starting Whale Footprint Auto-Hybrid Bot — polling", POLL_SECONDS, "seconds")
+    oi_hist: List[float] = []
+    recent_signals = set()
+
+    while True:
+        try:
+            # fetch futures + spot candles
+            fut_candles = fetch_futures_klines(FUTURES_SYMBOL, INTERVAL, limit=300)
+            spot_candles = fetch_spot_klines(SPOT_SYMBOL, INTERVAL, limit=300)
+
+            # prefer futures candles for footprint detection (richer for derivatives)
+            candles = fut_candles or spot_candles
+            if not candles:
+                print("No candles available; sleeping")
+                time.sleep(POLL_SECONDS)
+                continue
+
+            buy_idxs, sell_idxs, cvd = detect_stop_hunt_and_footprint(candles)
+
+            # fetch open interest from futures (if available)
+            oi = fetch_futures_open_interest(FUTURES_SYMBOL)
+            if oi and oi > 0:
+                oi_hist.append(oi)
+                if len(oi_hist) > 500:
+                    oi_hist = oi_hist[-500:]
+
+            # get coinglass heatmap (best-effort public)
+            heatmap = get_liquidation_heatmap(FUTURES_SYMBOL)
+
+            # evaluate recent footprint candidates
+            for idx in buy_idxs + sell_idxs:
+                c = candles[idx]
+                sig_key = (FUTURES_SYMBOL, c["time"])
+                if sig_key in recent_signals:
+                    continue
+                # require candidate to be among last 3 candles
+                if idx < len(candles) - 4:
+                    continue
+
+                # session filter
+                if USE_NY_SESSION and not is_in_ny_session(c["time"] * 1000):
+                    continue
+
+                side = "BUY" if idx in buy_idxs else "SELL"
+                oi_spike = check_oi_spike(oi_hist)
+                cvd_after = cvd[idx:]
+                cvd_rising = len(cvd_after) >= 2 and cvd_after[-1] > cvd_after[0]
+                liq_mass = liquidation_mass_near(c["close"], heatmap, window=max(50.0, c["close"]*0.005))
+
+                # confirmations per your strategy
+                buy_ok = side == "BUY" and oi_spike and cvd_rising and liq_mass > LIQ_THRESHOLD
+                sell_ok = side == "SELL" and oi_spike and (not cvd_rising) and liq_mass > LIQ_THRESHOLD
+
+                if buy_ok or sell_ok:
+                    side_str = "BUY" if buy_ok else "SELL"
+                    sl = round(c["low"], 2) if buy_ok else round(c["high"], 2)
+                    # compute a simple TP using RR and current price
+                    entry = round(c["close"], 2)
+                    tp = round(entry + (entry - sl) * RR, 2) if buy_ok else round(entry - (sl - entry) * RR, 2)
+
+                    msg = (
+                        f"🐋 WHALE FOOTPRINT {side_str} - {FUTURES_SYMBOL}
+"
+                        f"Entry: {entry}  SL: {sl}  TP: {tp}  RR:1:{RR}
+"
+                        f"OI_spike:{oi_spike}  CVD_rising:{cvd_rising}  LiqMass:{round(liq_mass,2)}"
+                    )
+                    send_alert(msg)
+                    recent_signals.add(sig_key)
+
+            # prune recent_signals to avoid memory growth
+            if len(recent_signals) > 2000:
+                recent_signals = set(list(recent_signals)[-1000:])
+
+        except Exception as e:
+            print("main loop err", e)
+
+        time.sleep(POLL_SECONDS)
+
 
 if __name__ == "__main__":
-    # basic credential check
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not TD_API_KEY:
-        print("Please set TELEGRAM_TOKEN, TELEGRAM_CHAT_ID and TD_API_KEY in environment or edit the script config.")
-        print("You can still test: call get_and_analyze() manually in interactive mode.")
-    else:
-        print("Starting Liquidity Matrix Bot v2...")
-        start_scheduler()
+    main_loop()
+
+# ===== FILE: requirements.txt =====
+# Keep versions compatible with Python 3.10
+python-telegram-bot==13.15
+requests==2.31.0
+python-dotenv==1.0.0
+
+# ===== FILE: Procfile =====
+worker: python bot.py
+
+# ===== FILE: .env.example =====
+# Copy to .env locally or set Render environment variables
+# TELEGRAM_TOKEN=123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+# TELEGRAM_CHAT_ID=@yourchannel or 123456789
+# BITGET_API_KEY=your_api_key
+# BITGET_API_SECRET=your_secret
+# BITGET_PASSPHRASE=your_passphrase (optional)
+# SPOT_SYMBOL=BTCUSDT
+# FUTURES_SYMBOL=BTCUSDT
+# INTERVAL=15m
+# POLL_SECONDS=60
+# VOL_SMA_LEN=20
+# VOL_MULT=2.2
+# WICK_RATIO=0.35
+# LIQ_THRESHOLD=10000
+
