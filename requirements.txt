@@ -1,6 +1,7 @@
 python-telegram-bot==20.3
 requests==2.31.0
-websocket-client==1.6.3
+websocket-client==1.5.1
 pandas==2.2.2
-aiohttp==3.9.3
+aiohttp==3.8.6
 schedule==1.2.1
+
