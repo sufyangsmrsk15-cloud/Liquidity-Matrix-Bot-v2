@@ -1,7 +1,9 @@
-python-telegram-bot==20.3
+# ✅ Render-safe, Python 3.10 verified versions
+python-telegram-bot==20.1
 requests==2.31.0
 websocket-client==1.5.1
 pandas==2.2.2
-aiohttp==3.8.6
+aiohttp==3.8.4
 schedule==1.2.1
-
+setuptools==70.0.0
+wheel==0.43.0
