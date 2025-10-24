@@ -1,9 +1,4 @@
-# ✅ Render-safe, Python 3.10 compatible, no compilation needed
-python-telegram-bot==20.0
+python-telegram-bot==13.15
 requests==2.31.0
-websocket-client==1.3.3
-pandas==1.5.3
-aiohttp==3.8.3
-schedule==1.1.0
-setuptools==70.0.0
-wheel==0.43.0
+python-dotenv==1.0.0
+
